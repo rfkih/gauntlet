@@ -1,0 +1,78 @@
+[project]
+name = "blackheart-ingest"
+version = "0.1.0"
+description = "Blackheart ML/sentiment ingestion. Pulls from 7 free external sources (FRED, Binance, DefiLlama, etc.) into Postgres *_raw tables. Called by the Trading JVM's BackfillMl* handlers via HTTP."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Proprietary" }
+
+# Pinned to known-good majors. Majors stay pinned because async ecosystems
+# break across them; mirrors the convention in research-orchestrator.
+dependencies = [
+    "fastapi>=0.115,<0.120",
+    "uvicorn[standard]>=0.32,<0.40",
+    "pydantic>=2.9,<3",
+    "pydantic-settings>=2.6,<3",
+    "httpx>=0.27,<0.29",
+    "tenacity>=9.0,<10",                # retry decorators for flaky sources
+    "structlog>=24.4,<26",
+    # Sync DB driver — heavy_ingest runs as a one-shot CLI; the FastAPI
+    # handlers do small writes only. We avoid asyncpg to keep the connection
+    # model simple. If throughput becomes a concern, swap to async later.
+    "psycopg[binary]>=3.2,<4",
+    # FRED + ALFRED client. fredapi is the canonical Python wrapper around
+    # the FRED API; it handles auth, paging, and the ALFRED vintage endpoint.
+    "fredapi>=0.5,<0.6",
+    # Pandas only because fredapi returns DataFrames and we don't want to
+    # rewrite that. Kept minimal — no analytics in this service.
+    "pandas>=2.2,<3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3,<9",
+    "pytest-asyncio>=0.24,<0.30",
+    "ruff>=0.7,<1",
+    "mypy>=1.13,<2",
+    "respx>=0.21,<0.23",          # httpx mocking
+]
+
+# HTML scraping for the (currently unused) ForexFactory HTML fallback.
+# Pull this in only if/when we move forexfactory.py off the JSON mirror.
+# lxml lacks prebuilt wheels on bleeding-edge Python — installing without
+# MSVC build tools fails on Windows. Keep optional until needed.
+html-scrape = [
+    "beautifulsoup4>=4.12,<5",
+    "lxml>=5.3,<7",
+]
+
+[project.scripts]
+# Three entry points matching the deployment topology:
+#   server      — FastAPI HTTP server, called by Java handlers
+#   heavy       — one-shot historical backfill CLI (home box)
+#   live        — scheduled live-ingest worker (VPS)
+blackheart-ingest-server  = "blackheart_ingest.workers.server:main"
+blackheart-ingest-heavy   = "blackheart_ingest.workers.heavy_ingest:main"
+blackheart-ingest-live    = "blackheart_ingest.workers.live_ingest:main"
+blackheart-ingest-compute = "blackheart_ingest.workers.compute_features:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/blackheart_ingest"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "RUF"]
+ignore = [
+    "E501",  # line-too-long, already at 100
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
