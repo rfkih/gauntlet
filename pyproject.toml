@@ -26,6 +26,15 @@ dependencies = [
     # Pandas only because fredapi returns DataFrames and we don't want to
     # rewrite that. Kept minimal — no analytics in this service.
     "pandas>=2.2,<3",
+    # numpy is a pandas transitive but we use it directly in the inference
+    # module (predict path: argmax, abs, etc.). Pinning the bound aligns
+    # with blackheart-train so unpickled boosters share array semantics.
+    "numpy>=2.0,<3",
+    # Phase 4 / Phase C inference sidecar: needed to unpickle and run
+    # boosters from blackheart-train artifacts. Pinned to the same major
+    # as blackheart-train so binary compatibility is preserved when an
+    # artifact moves between repos.
+    "lightgbm>=4.5,<5",
 ]
 
 [project.optional-dependencies]
@@ -51,10 +60,14 @@ html-scrape = [
 #   server      — FastAPI HTTP server, called by Java handlers
 #   heavy       — one-shot historical backfill CLI (home box)
 #   live        — scheduled live-ingest worker (VPS)
-blackheart-ingest-server  = "blackheart_ingest.workers.server:main"
-blackheart-ingest-heavy   = "blackheart_ingest.workers.heavy_ingest:main"
-blackheart-ingest-live    = "blackheart_ingest.workers.live_ingest:main"
-blackheart-ingest-compute = "blackheart_ingest.workers.compute_features:main"
+blackheart-ingest-server    = "blackheart_ingest.workers.server:main"
+blackheart-ingest-heavy     = "blackheart_ingest.workers.heavy_ingest:main"
+blackheart-ingest-live      = "blackheart_ingest.workers.live_ingest:main"
+blackheart-ingest-compute   = "blackheart_ingest.workers.compute_features:main"
+# Phase 4 / Phase C — inference sidecar backfill worker. Loads a model
+# artifact, reuses blackheart-train's loader for bit-equivalent feature
+# assembly, runs booster.predict, upserts signal_history rows.
+blackheart-ingest-inference = "blackheart_ingest.workers.inference_backfill:main"
 
 [build-system]
 requires = ["hatchling"]

@@ -311,7 +311,18 @@ def compute(
             # and any future cleanup tied to it runs correctly.
             ctx.__exit__(*sys.exc_info())  # type: ignore[has-type]
 
-    if wide_df is None or wide_df.empty:
+    # Multi-symbol path returns a dict; single-symbol path returns a DataFrame.
+    # Empty-input check has to handle both shapes — for dict, _compute_from_
+    # market_data already raised on any empty frame, so a non-None dict is
+    # known non-empty here. We only need the .empty check for the DataFrame
+    # path.
+    if wide_df is None:
+        logger.info(
+            "compute %s v%d -> no input rows in [%s, %s]; returning empty",
+            feat.name, feat.version, start, end,
+        )
+        return pd.DataFrame(columns=["ts", "value", "name", "version", "family"])
+    if isinstance(wide_df, pd.DataFrame) and wide_df.empty:
         logger.info(
             "compute %s v%d -> no input rows in [%s, %s]; returning empty",
             feat.name, feat.version, start, end,
@@ -362,11 +373,33 @@ def _compute_from_market_data(
     interval: str,
     start: datetime,
     end: datetime,
-) -> pd.DataFrame:
-    # The wide market_data frame already has the columns the transformer
-    # needs; no pivot, no ffill (gapless bars). We just trust market_data
-    # and let the transformer ask for whatever column it declared in inputs.
-    return _read_market_data_wide(conn, symbol, interval, start, end)
+) -> pd.DataFrame | dict[str, pd.DataFrame]:
+    """Read market_data for the transformer. Returns either a single wide
+    DataFrame (today's per-symbol path) or a ``{symbol: DataFrame}`` dict
+    (multi-symbol path used by cross-asset features like eth_btc_corr_24h).
+
+    Multi-symbol path is triggered by ``feat.required_symbols`` being
+    non-empty. The dispatcher reads each named symbol at the same
+    ``interval`` and ``[start, end]`` window. The output is still stamped
+    with the request's ``symbol`` — the required_symbols are *additional
+    inputs* the transformer needs to see, not extra output keys.
+    """
+    if not feat.required_symbols:
+        # Per-symbol path: trust market_data and let the transformer ask for
+        # whatever column it declared in inputs.
+        return _read_market_data_wide(conn, symbol, interval, start, end)
+
+    bundle: dict[str, pd.DataFrame] = {}
+    for sym in feat.required_symbols:
+        df = _read_market_data_wide(conn, sym, interval, start, end)
+        if df.empty:
+            raise FeatureComputeError(
+                f"feature={feat.name}: market_data has no rows for "
+                f"symbol={sym} interval={interval} in [{start}, {end}]. "
+                f"Backfill required before computing this cross-asset feature."
+            )
+        bundle[sym] = df
+    return bundle
 
 
 def default_window(days_back: int = 180) -> tuple[datetime, datetime]:

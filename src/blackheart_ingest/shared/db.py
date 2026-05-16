@@ -73,6 +73,15 @@ def write_macro_raw_rows(
         ingestion_time (datetime), value (numeric or None), value_text (str or None),
         content_hash, schema_version (int, default 1).
 
+    Uses ``executemany`` so all inserts share one prepared statement and
+    pipeline through the connection in a single round-trip batch
+    (psycopg3 default behaviour). Per-row ``execute()`` would issue N
+    network round-trips and N statement preparations — ~10-50× slower
+    on bulk backfills (audit finding H5, 2026-05-16). ``cur.rowcount``
+    after ``executemany`` aggregates affected rows across every batched
+    INSERT, which gives the inserted count directly without needing
+    ``RETURNING ingestion_id``.
+
     Returns
     -------
     (inserted, skipped_duplicate)
@@ -90,21 +99,21 @@ def write_macro_raw_rows(
             %(value)s, %(value_text)s, %(content_hash)s, %(schema_version)s
         )
         ON CONFLICT DO NOTHING
-        RETURNING ingestion_id
     """
+
+    # Preserve original in-place ``setdefault`` semantics — callers may
+    # rely on seeing the populated schema_version on the input dicts.
+    for row in rows:
+        row.setdefault("schema_version", 1)
 
     owned_conn = conn is None
     if owned_conn:
         ctx = get_connection()
         conn = ctx.__enter__()
     try:
-        inserted = 0
         with conn.cursor() as cur:
-            for row in rows:
-                row.setdefault("schema_version", 1)
-                cur.execute(sql, row)
-                if cur.rowcount == 1:
-                    inserted += 1
+            cur.executemany(sql, rows)
+            inserted = cur.rowcount if cur.rowcount is not None else 0
         conn.commit()
         skipped = len(rows) - inserted
         return inserted, skipped

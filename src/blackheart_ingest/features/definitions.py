@@ -22,12 +22,20 @@ one at a time.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Callable, Literal
+from typing import Callable, Literal, Union
 
 import numpy as np
 import pandas as pd
 
 FfillPolicy = Literal["last_value"]
+
+# Single-symbol transformer (today's path): receives one wide DataFrame.
+# Multi-symbol transformer (cross-asset features like eth_btc_corr_24h):
+# receives {symbol: wide DataFrame}. Dispatcher picks based on
+# ``FeatureDef.required_symbols``.
+FeatureTransformer = Callable[
+    [Union[pd.DataFrame, dict[str, pd.DataFrame]]], pd.Series
+]
 
 
 @dataclass(frozen=True)
@@ -43,7 +51,7 @@ class FeatureDef:
     #   OHLCV columns), but validated against ``_MARKET_DATA_COLS`` in the
     #   engine so a typo surfaces clearly instead of as a pandas KeyError.
     inputs: tuple[str, ...]
-    transformer: Callable[[pd.DataFrame], pd.Series]
+    transformer: FeatureTransformer
     pit_safe: bool = True
     ffill_policy: FfillPolicy | None = None
     max_ffill_age_hours: int | None = None
@@ -67,6 +75,18 @@ class FeatureDef:
     symbols: tuple[str, ...] = field(default=())
     intervals: tuple[str, ...] = field(default=())
 
+    # Extra symbols the transformer needs to READ besides the request's
+    # output symbol. Empty (default) = single-symbol path: dispatcher reads
+    # the request's symbol and passes a single DataFrame to the transformer.
+    # Non-empty = multi-symbol path: dispatcher reads each named symbol from
+    # market_data and passes a {symbol: DataFrame} dict to the transformer.
+    # The output is still stamped with the request's symbol/interval — these
+    # are *inputs*, not output keys.
+    #
+    # Example: eth_btc_corr_24h is BTCUSDT-stamped but reads ETH bars to
+    # compute the correlation. required_symbols=("BTCUSDT", "ETHUSDT").
+    required_symbols: tuple[str, ...] = field(default=())
+
     def __post_init__(self) -> None:
         if bool(self.symbols) != bool(self.intervals):
             raise ValueError(
@@ -74,6 +94,12 @@ class FeatureDef:
                 f"intervals must be both empty (global feature) or both "
                 f"set (per-bar feature). Got symbols={self.symbols!r} "
                 f"intervals={self.intervals!r}."
+            )
+        if self.required_symbols and self.raw_tables != ("market_data",):
+            raise ValueError(
+                f"FeatureDef '{self.name}' v{self.version}: required_symbols "
+                f"is only supported for market_data features. Got "
+                f"raw_tables={self.raw_tables!r}."
             )
 
 
@@ -171,6 +197,85 @@ def _ratio_momentum(
     return _impl
 
 
+def _log_return(close_col: str, periods: int) -> Callable[[pd.DataFrame], pd.Series]:
+    """``log(close[t] / close[t - periods])`` — periods-bar log return.
+
+    Mirrors blackheart-train's ``_t_btc_log_return_24h`` exactly so the
+    registry-sourced feature matches the train-time derived feature
+    bit-for-bit on the same market_data input.
+    """
+
+    def _impl(df: pd.DataFrame) -> pd.Series:
+        c = df[close_col].astype("float64")
+        return np.log(c / c.shift(periods))
+
+    return _impl
+
+
+def _cross_asset_correlation(
+    close_col_a: str,
+    close_col_b: str,
+    window_bars: int,
+) -> Callable[[dict[str, pd.DataFrame]], pd.Series]:
+    """Rolling correlation between two symbols' 1-bar log returns.
+
+    Multi-symbol transformer: takes ``{symbol_a: df, symbol_b: df}`` keyed
+    by symbol (NOT column name — see note below). The dispatcher routes
+    this shape based on ``FeatureDef.required_symbols``.
+
+    Why dict-keyed-by-symbol vs the single-DataFrame contract: cross-asset
+    features need two independent OHLCV histories. Stuffing both into one
+    wide frame (e.g. ``close_price_BTC``, ``close_price_ETH``) would force
+    every transformer to learn a symbol-suffixed column convention. A dict
+    is cleaner — and matches blackheart-train's ``fetch_market_data_bundle``
+    contract so train-time derived features and registry features share the
+    same transformer shape.
+
+    Args:
+        close_col_a / close_col_b: the close column inside each symbol's
+            wide frame. Same name for symmetric features (both
+            ``close_price``); different names only if the two symbols come
+            from different OHLCV schemas (not the case today).
+        window_bars: rolling window for the correlation.
+
+    Mirrors blackheart-train's ``_t_eth_btc_corr_24h`` semantics: explicit
+    inner-join on the timestamp index before the rolling correlation so
+    the window always has paired observations, then reindex back onto the
+    primary symbol's grid.
+    """
+    # The first key in the dict is conventionally the OUTPUT-symbol's frame;
+    # for eth_btc_corr_24h on BTCUSDT-stamped output, the reindex target is
+    # the BTC index. Caller-side we'll pass required_symbols=("BTCUSDT",
+    # "ETHUSDT") and the transformer below picks them up positionally.
+
+    def _impl(md: dict[str, pd.DataFrame]) -> pd.Series:
+        # Order-stable iteration: required_symbols order is preserved by the
+        # dispatcher when building the dict, so the first symbol is the
+        # output-symbol (BTC) and the second is the cross-asset input (ETH).
+        symbols = list(md.keys())
+        if len(symbols) != 2:
+            raise ValueError(
+                f"_cross_asset_correlation expected exactly 2 symbols; "
+                f"got {symbols!r}"
+            )
+        sym_a, sym_b = symbols[0], symbols[1]
+        close_a = md[sym_a][close_col_a].astype("float64")
+        close_b = md[sym_b][close_col_b].astype("float64")
+        ret_a = np.log(close_a / close_a.shift(1))
+        ret_b = np.log(close_b / close_b.shift(1))
+        # Inner-align: rows where either return is NaN drop out so the
+        # rolling window sees only paired observations.
+        paired = pd.DataFrame({"a": ret_a, "b": ret_b}).dropna()
+        rho = paired["a"].rolling(window_bars).corr(paired["b"])
+        # Reindex onto the OUTPUT symbol's index so the loader's
+        # reindex(bar_index) step has the full index to project from. Bars
+        # without paired observations remain NaN (compute()'s dropna()
+        # filters them before persist).
+        return rho.reindex(close_a.index)
+
+    return _impl
+
+
 def _rolling_realized_vol(
     close_col: str,
     window_bars: int,
@@ -258,6 +363,53 @@ def _forward_sharpe_binary_sign(
         # (NaN > 0) -> False -> 0.0 in pandas; restore NaN so dropna()
         # can drop rows where forward data isn't fully available.
         return binary.where(sharpe.notna(), other=pd.NA)
+
+    return _impl
+
+
+def _forward_sharpe_binary_sign_train_compat(
+    close_col: str, horizon_bars: int
+) -> Callable[[pd.DataFrame], pd.Series]:
+    """Bit-equivalent twin of ``_forward_sharpe_binary_sign`` matching
+    blackheart-train's ``_t_label_regime_risk_on_24h`` pandas idiom.
+
+    The difference: this version computes ``log_ret.shift(-N).rolling(N).
+    std()`` (shift THEN rolling) — train-side's order — while the other
+    version does ``log_ret.rolling(N).std().shift(-N)`` (rolling THEN
+    shift). Both compute std of log_ret over the forward window for
+    ``t >= N-1`` but diverge at the leading boundary: rolling-on-shifted
+    is NaN for ``t < N-1`` (the rolling window has out-of-bounds rows on
+    the left), while shifted-rolling produces valid values there.
+
+    Used for ``label_regime_risk_on_24h`` v1 so the registry-resolved
+    label is bit-equivalent to blackheart-train's derived label — a
+    requirement for the regime_btc_v2 -> regime_btc_v3 spec swap to be
+    safe by construction. Don't replace ``_forward_sharpe_binary_sign``
+    with this — the existing v1 label features depend on the current
+    idiom and must not change behavior.
+
+    Train-side also multiplies fwd_std by ``np.sqrt(horizon_bars)``;
+    since the output binarizes on ``sign(sharpe)`` and sqrt is positive,
+    the multiplication is sign-preserving. We mirror it here for full
+    semantic parity, but the resulting binary is identical with or
+    without the factor.
+    """
+
+    def _impl(df: pd.DataFrame) -> pd.Series:
+        c = df[close_col].astype("float64")
+        log_ret = np.log(c / c.shift(1))
+        fwd_ret = (c.shift(-horizon_bars) - c) / c
+        # shift FIRST, then rolling — this is the train-side order.
+        fwd_std = (
+            log_ret.shift(-horizon_bars).rolling(horizon_bars).std()
+            * np.sqrt(horizon_bars)
+        )
+        sharpe = fwd_ret / fwd_std.where(fwd_std > 0)
+        binary = (sharpe > 0).astype("float64")
+        # Restore NaN where sharpe is NaN (insufficient future data) so
+        # the engine's dropna() filters those rows out before persist.
+        binary[sharpe.isna()] = np.nan
+        return binary
 
     return _impl
 
@@ -620,6 +772,117 @@ FEATURES: tuple[FeatureDef, ...] = (
         description="30-day annualized realized volatility of BTC close-to-close log returns. "
         "Computed on 1h bars (window=720); annualization scales the rolling std "
         "by sqrt(8760) = sqrt(24 * 365).",
+    ),
+    # ── Phase 4 / regime_btc_v2 derived features (4) — ported from
+    # blackheart-train.derived_features so the live inference path can
+    # source them from feature_values instead of computing at train time.
+    # These match the four entries in DERIVED_FEATURES on the train side.
+    FeatureDef(
+        name="btc_log_return_24h",
+        version=1,
+        family="technical",
+        inputs=("close_price",),
+        transformer=_log_return(close_col="close_price", periods=24),
+        pit_safe=True,
+        ffill_policy=None,
+        raw_tables=("market_data",),
+        symbols=("BTCUSDT",),
+        intervals=("1h",),
+        description="24-bar log return of BTC close. Ported from "
+        "blackheart_train.derived_features._t_btc_log_return_24h for "
+        "regime_btc_v2 deployment-readiness.",
+    ),
+    FeatureDef(
+        name="btc_realized_vol_7d",
+        version=1,
+        family="technical",
+        inputs=("close_price",),
+        # Match blackheart-train: log_ret.rolling(168).std() with no
+        # annualization. window_bars=168 = 7 days * 24h; min_periods=168
+        # matches pandas' default rolling().std() behavior.
+        transformer=_rolling_realized_vol(
+            close_col="close_price",
+            window_bars=168,
+            min_periods=168,
+            annualize_factor=None,
+        ),
+        pit_safe=True,
+        ffill_policy=None,
+        raw_tables=("market_data",),
+        symbols=("BTCUSDT",),
+        intervals=("1h",),
+        description="7-day realized volatility of BTC log returns (no "
+        "annualization). Ported from blackheart_train.derived_features."
+        "_t_btc_realized_vol_7d for regime_btc_v2 deployment-readiness.",
+    ),
+    FeatureDef(
+        name="btc_volume_zscore_24h",
+        version=1,
+        family="technical",
+        inputs=("volume",),
+        # Match blackheart-train: 24-bar rolling z-score of volume. The
+        # train-side uses std > 1e-12; ingest uses std > 0. For real BTC
+        # volume data, std is always > 1e-12, so the difference produces
+        # zero numerical disagreement. See _rolling_zscore.
+        transformer=_rolling_zscore("volume", window=24, min_periods=24),
+        pit_safe=True,
+        ffill_policy=None,
+        raw_tables=("market_data",),
+        symbols=("BTCUSDT",),
+        intervals=("1h",),
+        description="24-bar rolling z-score of BTC volume. Ported from "
+        "blackheart_train.derived_features._t_btc_volume_zscore_24h for "
+        "regime_btc_v2 deployment-readiness.",
+    ),
+    FeatureDef(
+        name="eth_btc_corr_24h",
+        version=1,
+        family="cross_asset",
+        inputs=("close_price",),
+        transformer=_cross_asset_correlation(
+            close_col_a="close_price",
+            close_col_b="close_price",
+            window_bars=24,
+        ),
+        pit_safe=True,
+        ffill_policy=None,
+        raw_tables=("market_data",),
+        symbols=("BTCUSDT",),
+        intervals=("1h",),
+        # Multi-symbol: needs BTC AND ETH bars. required_symbols order is
+        # load-bearing — first symbol is the output-stamped one (BTC), the
+        # rolling correlation is reindexed onto its grid.
+        required_symbols=("BTCUSDT", "ETHUSDT"),
+        description="24-bar rolling correlation between BTC and ETH 1h "
+        "log returns. Cross-asset signal — when corr breaks down, the "
+        "crypto regime is often shifting. Ported from blackheart_train."
+        "derived_features._t_eth_btc_corr_24h for regime_btc_v2.",
+    ),
+    # ── Phase 4 / regime_btc_v2 derived LABEL ─────────────────────────
+    FeatureDef(
+        name="label_regime_risk_on_24h",
+        version=1,
+        family="label",
+        inputs=("close_price",),
+        # Uses the train-compat twin (shift-then-rolling) rather than the
+        # default _forward_sharpe_binary_sign (rolling-then-shift). The two
+        # are mathematically equivalent for t >= horizon-1 but diverge at
+        # the leading boundary; train-compat matches blackheart-train's
+        # _t_label_regime_risk_on_24h bit-for-bit so the regime_btc_v2 ->
+        # v3 spec swap (reading from registry) preserves identical
+        # training data.
+        transformer=_forward_sharpe_binary_sign_train_compat(
+            close_col="close_price", horizon_bars=24
+        ),
+        pit_safe=False,
+        ffill_policy=None,
+        raw_tables=("market_data",),
+        symbols=("BTCUSDT",),
+        intervals=("1h",),
+        description="Binary label: 1 if forward-24h Sharpe (return / vol) "
+        "is positive, else 0. Bit-equivalent port of blackheart_train."
+        "derived_features._t_label_regime_risk_on_24h for regime_btc_v2 "
+        "deployment-readiness. Uses the shift-then-rolling pandas idiom.",
     ),
     # ── Blueprint § 5.6: Forward-looking labels (3 of 4 shipped here;
     # label_triple_barrier deferred — needs bar-stepping algorithm) ───
