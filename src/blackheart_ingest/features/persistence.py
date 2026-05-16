@@ -230,14 +230,53 @@ def _update_run_status(
             ctx.__exit__(None, None, None)  # type: ignore[has-type]
 
 
+def _count_persisted_for_run(
+    run_id: uuid.UUID,
+    *,
+    conn: psycopg.Connection | None = None,
+) -> int:
+    """Ground-truth count of feature_values rows currently attributed to a run.
+
+    Note that ``write_values`` upserts with ``ON CONFLICT DO UPDATE`` and
+    overwrites ``compute_run_id`` on conflict — so this counts only rows
+    whose latest writer was this run, not historical attempts.
+    """
+    sql = "SELECT COUNT(*) FROM feature_values WHERE compute_run_id = %(run_id)s"
+    owned = conn is None
+    if owned:
+        ctx = get_connection()
+        conn = ctx.__enter__()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, {"run_id": run_id})
+            row = cur.fetchone()
+        return int(row[0]) if row else 0
+    finally:
+        if owned:
+            ctx.__exit__(None, None, None)  # type: ignore[has-type]
+
+
 def finish_run(
     run_id: uuid.UUID,
     *,
     rows_written: int,
     conn: psycopg.Connection | None = None,
 ) -> None:
-    _update_run_status(run_id, status="done", rows_written=rows_written, conn=conn)
-    logger.info("feature_compute_run done | run_id=%s rows=%d", run_id, rows_written)
+    """Mark a run done. Audit-row rows_written is reconciled against
+    feature_values: write_values and the run-row UPDATE commit in separate
+    transactions, so a crash between them can leave the audit row claiming
+    more rows than landed (or vice-versa). The DB count is ground truth;
+    a divergence emits WARN so the operator can investigate.
+    """
+    persisted = _count_persisted_for_run(run_id, conn=conn)
+    if persisted != rows_written:
+        logger.warning(
+            "feature_compute_run reconciliation mismatch | run_id=%s "
+            "caller_reported=%d db_count=%d -- recording db_count",
+            run_id, rows_written, persisted,
+        )
+    _update_run_status(run_id, status="done", rows_written=persisted, conn=conn)
+    logger.info("feature_compute_run done | run_id=%s rows=%d", run_id, persisted)
 
 
 def fail_run(
