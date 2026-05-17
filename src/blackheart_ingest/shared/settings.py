@@ -19,25 +19,21 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # ── Postgres (shared with trading JVM) ─────────────────────────────────
+    # Postgres — shared with trading JVM.
     db_host: str = "localhost"
     db_port: int = 5432
     db_name: str = "trading_db"
     db_user: str = "blackheart_trading"
     db_password: str = ""
 
-    # ── HTTP server ────────────────────────────────────────────────────────
     server_host: str = "127.0.0.1"
     server_port: int = 8089
 
-    # ── Source credentials ─────────────────────────────────────────────────
     fred_api_key: str = ""
 
-    # ── Behaviour flags ────────────────────────────────────────────────────
     default_max_backfill_lag_hours: int = Field(default=72, ge=1, le=8760)
     log_level: str = "INFO"
 
-    # ── Convenience ────────────────────────────────────────────────────────
     def db_kwargs(self) -> dict[str, object]:
         """Connection keyword args for ``psycopg.connect(**kwargs)``.
 

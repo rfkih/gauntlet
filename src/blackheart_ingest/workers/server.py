@@ -41,7 +41,7 @@ from ..shared.settings import get_settings
 logger = logging.getLogger(__name__)
 
 
-# ── Source registry ─────────────────────────────────────────────────────────
+# Source registry.
 # Names match ml_ingest_schedule.source AND the Python module names under
 # blackheart_ingest.sources. Add a row here when implementing a new source;
 # the rest of the system picks it up automatically.
@@ -72,9 +72,6 @@ def _import_source(source: str) -> ModuleType:
     return importlib.import_module(mod_path)
 
 
-# ── Request schema ──────────────────────────────────────────────────────────
-
-
 class PullRequest(BaseModel):
     """Request body for POST /pull/{source}. Mirrors IngestionRequest but
     expressed in pydantic so FastAPI validates + auto-documents.
@@ -84,9 +81,6 @@ class PullRequest(BaseModel):
     end: datetime = Field(..., description="ISO LocalDateTime, e.g. 2026-05-14T23:59:59")
     symbol: str | None = Field(default=None, description="Optional symbol scope")
     config: dict[str, Any] = Field(default_factory=dict, description="Source-specific params")
-
-
-# ── App ─────────────────────────────────────────────────────────────────────
 
 
 app = FastAPI(
@@ -156,9 +150,6 @@ def pull(source: str, body: PullRequest) -> dict[str, Any]:
     payload = result.to_json()
     payload["dispatch_duration_seconds"] = round(time.monotonic() - started, 3)
     return payload
-
-
-# ── Feature compute endpoint ────────────────────────────────────────────────
 
 
 class ComputeRequest(BaseModel):
@@ -368,9 +359,6 @@ def compute_endpoint(feature_name: str, version: int, body: ComputeRequest) -> d
         "status": "done",
         "duration_seconds": round(time.monotonic() - started, 3),
     }
-
-
-# ── Entry point ─────────────────────────────────────────────────────────────
 
 
 def main() -> None:
