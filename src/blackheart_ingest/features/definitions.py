@@ -150,6 +150,40 @@ def _change_diff(col: str, periods: int) -> Callable[[pd.DataFrame], pd.Series]:
     return _impl
 
 
+def _sign_streak(col: str) -> Callable[[pd.DataFrame], pd.Series]:
+    """Count of consecutive bars with the same sign as the current bar.
+
+    Positive streak: +N when the last N bars (inclusive) are all positive.
+    Negative streak: -N when the last N bars (inclusive) are all negative.
+    Zero when the current bar is zero or NaN.
+
+    Encoding: sign(current) * streak_length. This lets the model see both
+    the direction (sign) and the persistence (magnitude) of the crowding.
+
+    Funding cadence example: a streak of +5 means funding has been positive
+    for 5 consecutive 8h periods (40h of crowded-long positioning).
+    """
+
+    def _impl(df: pd.DataFrame) -> pd.Series:
+        s = df[col].astype("float64")
+        signs = np.sign(s.to_numpy())
+        n = len(signs)
+        out = np.zeros(n, dtype="float64")
+        for i in range(n):
+            if signs[i] == 0 or np.isnan(signs[i]):
+                out[i] = 0.0
+                continue
+            streak = 1
+            j = i - 1
+            while j >= 0 and signs[j] == signs[i]:
+                streak += 1
+                j -= 1
+            out[i] = signs[i] * streak
+        return pd.Series(out, index=s.index)
+
+    return _impl
+
+
 def _rolling_percentile_rank(
     col: str, window: int, min_periods: int
 ) -> Callable[[pd.DataFrame], pd.Series]:
@@ -272,6 +306,42 @@ def _cross_asset_correlation(
         # without paired observations remain NaN (compute()'s dropna()
         # filters them before persist).
         return rho.reindex(close_a.index)
+
+    return _impl
+
+
+def _threshold_flag(
+    col: str, low: float, high: float
+) -> Callable[[pd.DataFrame], pd.Series]:
+    """Ternary extreme flag: +1 when value > high, -1 when < low, 0 otherwise.
+
+    For taker buy ratio: >0.65 = buyer dominance, <0.35 = seller dominance.
+    Encodes crowding extremes that a raw passthrough ratio can't expose as a
+    discrete categorical signal.
+    """
+
+    def _impl(df: pd.DataFrame) -> pd.Series:
+        s = df[col].astype("float64")
+        result = pd.Series(0.0, index=s.index)
+        result = result.where(~(s > high), other=1.0)
+        result = result.where(~(s < low), other=-1.0)
+        return result.where(s.notna())
+
+    return _impl
+
+
+def _acceleration(col: str, periods: int) -> Callable[[pd.DataFrame], pd.Series]:
+    """Second derivative of ``col``: diff of pct_change over ``periods`` rows.
+
+    Captures the rate-of-change of a trend rather than the trend itself.
+    On OI: positive = leverage build-up accelerating; negative = growth
+    slowing or unwinding. Useful for detecting inflection points.
+    """
+
+    def _impl(df: pd.DataFrame) -> pd.Series:
+        s = df[col].astype("float64")
+        velocity = s.pct_change(periods=periods)
+        return velocity.diff(periods=periods)
 
     return _impl
 
@@ -427,6 +497,67 @@ def _atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
     tr3 = (low - close_prev).abs()
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
     return tr.rolling(n).mean()
+
+
+def _rsi(close_col: str = "close_price", window: int = 14) -> Callable[[pd.DataFrame], pd.Series]:
+    """Relative Strength Index over ``window`` bars.
+
+    Standard definition: average gain / average loss over the trailing
+    window, smoothed via SMA (Wilder's smoothing replaced with SMA for
+    deterministic, closed-form computation matching the ``_atr`` precedent
+    in this module). Bounded in [0, 100].
+
+    PIT-safe: all inputs at row t come from rows <= t. NaN for the first
+    ``window`` rows (insufficient history); engine's dropna() filters them.
+
+    Path B (2026-05-21): adds bar-level entry-timing feature for
+    directional_btc_1h_v4 — prior macro/24h-aggregation feature stack
+    failed to provide bar-level signal (RUN_SUMMARY a957d7cf).
+    """
+
+    def _impl(df: pd.DataFrame) -> pd.Series:
+        c = df[close_col].astype("float64")
+        delta = c.diff()
+        gain = delta.clip(lower=0)
+        loss = (-delta).clip(lower=0)
+        avg_gain = gain.rolling(window, min_periods=window).mean()
+        avg_loss = loss.rolling(window, min_periods=window).mean()
+        # avoid divide-by-zero: when avg_loss is zero, RS is +infinity ->
+        # RSI = 100; standard convention. NaN preserved by rolling().mean().
+        rs = avg_gain / avg_loss.where(avg_loss > 0)
+        rsi = 100.0 - (100.0 / (1.0 + rs))
+        # When avg_loss == 0 AND avg_gain > 0: rs is NaN (masked), rsi NaN.
+        # Replace with 100.0 by the canonical convention.
+        rsi = rsi.where(~((avg_loss == 0) & (avg_gain > 0)), other=100.0)
+        # When avg_loss == 0 AND avg_gain == 0: flat market, RSI 50 by convention.
+        rsi = rsi.where(~((avg_loss == 0) & (avg_gain == 0)), other=50.0)
+        return rsi
+
+    return _impl
+
+
+def _atr_ratio(
+    atr_window: int = 14,
+    smoothing_window: int = 24,
+) -> Callable[[pd.DataFrame], pd.Series]:
+    """Ratio of current ATR_n to its rolling mean over ``smoothing_window``
+    bars. A regime-normalized volatility measure: > 1 means the current
+    ATR is elevated vs the recent average, < 1 means compressed.
+
+    PIT-safe: ATR_n at row t reads rows (t-n+1, t); the smoothing window
+    further averages those ATRs over (t-smoothing+1, t). All inputs
+    causal.
+
+    Path B (2026-05-21): adds bar-level volatility-regime feature for
+    directional_btc_1h_v4.
+    """
+
+    def _impl(df: pd.DataFrame) -> pd.Series:
+        atr = _atr(df, atr_window)
+        atr_avg = atr.rolling(smoothing_window, min_periods=smoothing_window).mean()
+        return atr / atr_avg.where(atr_avg > 0)
+
+    return _impl
 
 
 def _forward_meanrev_atr(
@@ -688,6 +819,35 @@ FEATURES: tuple[FeatureDef, ...] = (
         max_ffill_age_hours=24,
         description="24-hour absolute change in top-trader long/short account ratio (1h cadence).",
     ),
+    # ── funding_regime_v1 features (V121) ─────────────────────────────────
+    FeatureDef(
+        name="btc_funding_sign_streak",
+        version=1,
+        family="positioning",
+        inputs=("binance_funding_rate_btcusdt",),
+        transformer=_sign_streak("binance_funding_rate_btcusdt"),
+        ffill_policy="last_value",
+        max_ffill_age_hours=24,
+        description="Signed streak of consecutive 8h funding bars with the same sign. "
+        "Positive N means funding positive for N consecutive 8h periods (crowded longs); "
+        "negative N means funding negative for N consecutive 8h periods (crowded shorts). "
+        "V121 — funding_regime_v1 input.",
+    ),
+    FeatureDef(
+        name="btc_funding_percentile_30d",
+        version=1,
+        family="positioning",
+        # 30 days at 8h cadence = 90 rows.
+        inputs=("binance_funding_rate_btcusdt",),
+        transformer=_rolling_percentile_rank(
+            "binance_funding_rate_btcusdt", window=90, min_periods=20
+        ),
+        ffill_policy="last_value",
+        max_ffill_age_hours=24,
+        description="30-day percentile rank of BTC 8h funding rate in [0,1]. "
+        "window=90 rows (30d × 3 per day). High percentile = historically elevated "
+        "longs-crowded; low = shorts-crowded. V121 — funding_regime_v1 input.",
+    ),
     # ── Blueprint § 5.3: Flows (2 of 4 — exchange netflows need paid CM) ──
     FeatureDef(
         name="stablecoin_supply_change_7d",
@@ -767,11 +927,12 @@ FEATURES: tuple[FeatureDef, ...] = (
         pit_safe=True,
         ffill_policy=None,         # market_data is gapless per-bar
         raw_tables=("market_data",),
-        symbols=("BTCUSDT",),
-        intervals=("1h",),
-        description="30-day annualized realized volatility of BTC close-to-close log returns. "
+        # V110 (2026-05-20): expanded to (BTCUSDT, ETHUSDT).
+        symbols=("BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT", "DOGEUSDT", "AVAXUSDT"),
+        intervals=("1h", "4h"),
+        description="30-day annualized realized volatility of close-to-close log returns. "
         "Computed on 1h bars (window=720); annualization scales the rolling std "
-        "by sqrt(8760) = sqrt(24 * 365).",
+        "by sqrt(8760) = sqrt(24 * 365). V110 added ETHUSDT scope. V123 added SOLUSDT+4h.",
     ),
     # ── Phase 4 / regime_btc_v2 derived features (4) — ported from
     # blackheart-train.derived_features so the live inference path can
@@ -786,11 +947,19 @@ FEATURES: tuple[FeatureDef, ...] = (
         pit_safe=True,
         ffill_policy=None,
         raw_tables=("market_data",),
-        symbols=("BTCUSDT",),
-        intervals=("1h",),
-        description="24-bar log return of BTC close. Ported from "
+        # V110 (2026-05-20): added ETHUSDT so the same transformer runs
+        # over ETH close_price and writes (feature_name, symbol=ETHUSDT)
+        # rows to feature_values. The "btc_" name prefix is now a
+        # historical scope artifact — the load-bearing symbol identifier
+        # is the feature_values.symbol column. Renaming would require
+        # spec re-registration on every downstream consumer.
+        symbols=("BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT", "DOGEUSDT", "AVAXUSDT"),
+        intervals=("1h", "4h"),
+        description="24-bar log return of close. Originally ported from "
         "blackheart_train.derived_features._t_btc_log_return_24h for "
-        "regime_btc_v2 deployment-readiness.",
+        "regime_btc_v2 deployment-readiness. V110 added ETHUSDT scope "
+        "(same transformer, symbol-agnostic — operates on whatever "
+        "close_price column comes in via market_data). V123 added SOLUSDT+4h.",
     ),
     FeatureDef(
         name="btc_realized_vol_7d",
@@ -809,11 +978,14 @@ FEATURES: tuple[FeatureDef, ...] = (
         pit_safe=True,
         ffill_policy=None,
         raw_tables=("market_data",),
-        symbols=("BTCUSDT",),
-        intervals=("1h",),
-        description="7-day realized volatility of BTC log returns (no "
-        "annualization). Ported from blackheart_train.derived_features."
-        "_t_btc_realized_vol_7d for regime_btc_v2 deployment-readiness.",
+        # V110 (2026-05-20): expanded to (BTCUSDT, ETHUSDT) — see
+        # btc_log_return_24h note re symbol-prefix-as-historical-artifact.
+        symbols=("BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT", "DOGEUSDT", "AVAXUSDT"),
+        intervals=("1h", "4h"),
+        description="7-day realized volatility of log returns (no "
+        "annualization). Originally ported from blackheart_train."
+        "derived_features._t_btc_realized_vol_7d for regime_btc_v2. "
+        "V110 added ETHUSDT scope. V123 added SOLUSDT+4h.",
     ),
     FeatureDef(
         name="btc_volume_zscore_24h",
@@ -828,11 +1000,92 @@ FEATURES: tuple[FeatureDef, ...] = (
         pit_safe=True,
         ffill_policy=None,
         raw_tables=("market_data",),
-        symbols=("BTCUSDT",),
-        intervals=("1h",),
-        description="24-bar rolling z-score of BTC volume. Ported from "
-        "blackheart_train.derived_features._t_btc_volume_zscore_24h for "
-        "regime_btc_v2 deployment-readiness.",
+        # V110 (2026-05-20): expanded to (BTCUSDT, ETHUSDT).
+        symbols=("BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT", "DOGEUSDT", "AVAXUSDT"),
+        intervals=("1h", "4h"),
+        description="24-bar rolling z-score of volume. Originally ported "
+        "from blackheart_train.derived_features._t_btc_volume_zscore_24h "
+        "for regime_btc_v2 deployment-readiness. V110 added ETHUSDT scope. V123 added SOLUSDT+4h.",
+    ),
+    # ── Path B (2026-05-21) — bar-level entry-timing features ────────
+    # Added so directional_btc_1h_v4 can train on short-lookback,
+    # bar-level signal instead of the 24h-aggregation macro stack that
+    # prior v2 / v3 found provided no bar-level entry-timing edge
+    # (RUN_SUMMARY a957d7cf). Stamped on BTCUSDT + ETHUSDT 1h bars.
+    FeatureDef(
+        name="btc_rsi_14_1h",
+        version=1,
+        family="technical",
+        inputs=("close_price",),
+        transformer=_rsi(close_col="close_price", window=14),
+        pit_safe=True,
+        ffill_policy=None,
+        raw_tables=("market_data",),
+        symbols=("BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT", "DOGEUSDT", "AVAXUSDT"),
+        intervals=("1h", "4h"),
+        description="14-bar Relative Strength Index on close, SMA-smoothed. "
+        "Path B (2026-05-21) bar-level entry-timing feature for "
+        "directional_btc_1h_v4. 'btc_' prefix is historical scope "
+        "artifact; the symbol column is load-bearing. V123 added SOLUSDT+4h.",
+    ),
+    FeatureDef(
+        name="btc_atr_ratio_14_24",
+        version=1,
+        family="technical",
+        # _atr_ratio reads high/low/close internally; declare all three
+        # so the engine's inputs-vs-columns check passes for market_data.
+        inputs=("close_price", "high_price", "low_price"),
+        transformer=_atr_ratio(atr_window=14, smoothing_window=24),
+        pit_safe=True,
+        ffill_policy=None,
+        raw_tables=("market_data",),
+        symbols=("BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT", "DOGEUSDT", "AVAXUSDT"),
+        intervals=("1h", "4h"),
+        description="ATR_14 / mean(ATR_14, 24-bar window) — normalized "
+        "intraday vol regime. > 1 = vol elevated vs recent baseline. "
+        "Path B (2026-05-21). V123 added SOLUSDT+4h.",
+    ),
+    FeatureDef(
+        name="btc_log_return_1h",
+        version=1,
+        family="technical",
+        inputs=("close_price",),
+        transformer=_log_return(close_col="close_price", periods=1),
+        pit_safe=True,
+        ffill_policy=None,
+        raw_tables=("market_data",),
+        symbols=("BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT", "DOGEUSDT", "AVAXUSDT"),
+        intervals=("1h", "4h"),
+        description="1-bar log return on close (1h cadence). Bar-level "
+        "momentum signal. Path B (2026-05-21). V123 added SOLUSDT+4h.",
+    ),
+    FeatureDef(
+        name="btc_log_return_4h",
+        version=1,
+        family="technical",
+        inputs=("close_price",),
+        transformer=_log_return(close_col="close_price", periods=4),
+        pit_safe=True,
+        ffill_policy=None,
+        raw_tables=("market_data",),
+        symbols=("BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT", "DOGEUSDT", "AVAXUSDT"),
+        intervals=("1h", "4h"),
+        description="4-bar log return on close (1h cadence, 4h horizon). "
+        "Short-horizon momentum. Path B (2026-05-21). V123 added SOLUSDT+4h.",
+    ),
+    FeatureDef(
+        name="btc_volume_zscore_4h",
+        version=1,
+        family="technical",
+        inputs=("volume",),
+        transformer=_rolling_zscore("volume", window=4, min_periods=4),
+        pit_safe=True,
+        ffill_policy=None,
+        raw_tables=("market_data",),
+        symbols=("BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT", "DOGEUSDT", "AVAXUSDT"),
+        intervals=("1h", "4h"),
+        description="4-bar rolling z-score of volume (1h cadence, 4h window). "
+        "Short-horizon volume spike detector. Path B (2026-05-21). V123 added SOLUSDT+4h.",
     ),
     FeatureDef(
         name="eth_btc_corr_24h",
@@ -877,12 +1130,16 @@ FEATURES: tuple[FeatureDef, ...] = (
         pit_safe=False,
         ffill_policy=None,
         raw_tables=("market_data",),
-        symbols=("BTCUSDT",),
-        intervals=("1h",),
+        # V110 (2026-05-20): expanded to (BTCUSDT, ETHUSDT) so an ETH ML
+        # spec (e.g. regime_eth_v1) can train against the same forward-
+        # Sharpe-sign label computed from ETH close_price.
+        symbols=("BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT", "DOGEUSDT", "AVAXUSDT"),
+        intervals=("1h", "4h"),
         description="Binary label: 1 if forward-24h Sharpe (return / vol) "
         "is positive, else 0. Bit-equivalent port of blackheart_train."
         "derived_features._t_label_regime_risk_on_24h for regime_btc_v2 "
-        "deployment-readiness. Uses the shift-then-rolling pandas idiom.",
+        "deployment-readiness. Uses the shift-then-rolling pandas idiom. "
+        "At 4h cadence horizon_bars=24 covers 96h forward regime. V123 added SOLUSDT+4h.",
     ),
     # ── Blueprint § 5.6: Forward-looking labels (3 of 4 shipped here;
     # label_triple_barrier deferred — needs bar-stepping algorithm) ───
@@ -955,6 +1212,80 @@ FEATURES: tuple[FeatureDef, ...] = (
         "Class +1 if +1.5 ATR TP hit first, -1 if -1.0 ATR SL hit first "
         "(or both same bar — conservative fill), 0 on 24-bar timeout. "
         "Drives directional_btc_v1.",
+    ),
+    # ── V125: New BTC alpha surfaces (Rank 4 / 3 / 2 from data-scout) ────
+    # Rank 4 — Taker imbalance momentum (zero new raw data, highest ROI)
+    FeatureDef(
+        name="btc_taker_imbalance_momentum_8h",
+        version=1,
+        family="positioning",
+        inputs=("binance_taker_buy_sell_ratio_btcusdt_4h",),
+        transformer=_change_pct("binance_taker_buy_sell_ratio_btcusdt_4h", periods=8),
+        ffill_policy="last_value",
+        max_ffill_age_hours=24,
+        description="8-period % change of BTC 4h taker buy ratio (32h momentum window). "
+        "Detects accelerating buy-side or sell-side crowding. V125.",
+    ),
+    FeatureDef(
+        name="btc_taker_extreme_flag",
+        version=1,
+        family="positioning",
+        inputs=("binance_taker_buy_sell_ratio_btcusdt_4h",),
+        transformer=_threshold_flag(
+            "binance_taker_buy_sell_ratio_btcusdt_4h", low=0.35, high=0.65
+        ),
+        ffill_policy="last_value",
+        max_ffill_age_hours=24,
+        description="+1 when 4h taker buy ratio >0.65 (buyer dominance), "
+        "-1 when <0.35 (seller dominance), 0 otherwise. "
+        "Flags positioning extremes as a discrete signal. V125.",
+    ),
+    # Rank 3 — OI term-structure acceleration (zero new raw data)
+    FeatureDef(
+        name="btc_oi_accel_4h",
+        version=1,
+        family="positioning",
+        inputs=("binance_open_interest_btcusdt_1h",),
+        transformer=_acceleration("binance_open_interest_btcusdt_1h", periods=4),
+        ffill_policy="last_value",
+        max_ffill_age_hours=24,
+        description="Second derivative of BTC open interest: 4-period diff of "
+        "4-period pct_change on 1h OI series. Positive = leverage build-up "
+        "accelerating; negative = growth slowing or unwinding. V125.",
+    ),
+    # Rank 2 — On-chain free metrics (data already in DB via coinmetrics source)
+    FeatureDef(
+        name="btc_hashrate_momentum_30d",
+        version=1,
+        family="onchain",
+        inputs=("coinmetrics_btc_hashrate",),
+        transformer=_change_pct("coinmetrics_btc_hashrate", periods=30),
+        ffill_policy="last_value",
+        max_ffill_age_hours=72,
+        description="30-day % change in BTC hash rate (CoinMetrics HashRate, daily). "
+        "Rising hashrate signals miner confidence and network security growth. V125.",
+    ),
+    FeatureDef(
+        name="btc_active_addr_momentum_14d",
+        version=1,
+        family="onchain",
+        inputs=("coinmetrics_btc_adractcnt",),
+        transformer=_change_pct("coinmetrics_btc_adractcnt", periods=14),
+        ffill_policy="last_value",
+        max_ffill_age_hours=72,
+        description="14-day % change in BTC active address count (CoinMetrics AdrActCnt, "
+        "daily). Proxy for on-chain demand and user activity momentum. V125.",
+    ),
+    FeatureDef(
+        name="btc_txcnt_zscore_30d",
+        version=1,
+        family="onchain",
+        inputs=("coinmetrics_btc_txcnt",),
+        transformer=_rolling_zscore("coinmetrics_btc_txcnt", window=30, min_periods=10),
+        ffill_policy="last_value",
+        max_ffill_age_hours=72,
+        description="30-day rolling z-score of BTC transaction count (CoinMetrics TxCnt, "
+        "daily). Normalized on-chain activity level. V125.",
     ),
 )
 

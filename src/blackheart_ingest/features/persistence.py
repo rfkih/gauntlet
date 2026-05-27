@@ -241,7 +241,14 @@ def _count_persisted_for_run(
     overwrites ``compute_run_id`` on conflict — so this counts only rows
     whose latest writer was this run, not historical attempts.
     """
-    sql = "SELECT COUNT(*) FROM feature_values WHERE compute_run_id = %(run_id)s"
+    # SELECT with explicit alias so the row works under any row_factory
+    # (shared.db uses ``psycopg.rows.dict_row``, which makes ``row[0]``
+    # raise ``KeyError``; aliasing + dict access works in both
+    # tuple-row and dict-row modes). Bug found 2026-05-20: silent
+    # KeyError caused EVERY feature_compute_run to fail post-write,
+    # which is why feature_values stayed empty after V84 migration
+    # despite re-runs.
+    sql = "SELECT COUNT(*) AS n FROM feature_values WHERE compute_run_id = %(run_id)s"
     owned = conn is None
     if owned:
         ctx = get_connection()
@@ -250,7 +257,13 @@ def _count_persisted_for_run(
         with conn.cursor() as cur:
             cur.execute(sql, {"run_id": run_id})
             row = cur.fetchone()
-        return int(row[0]) if row else 0
+        if not row:
+            return 0
+        # Dict-row access; if row_factory is tuple-row, fall back to [0].
+        try:
+            return int(row["n"])
+        except (TypeError, KeyError):
+            return int(row[0])
     finally:
         if owned:
             ctx.__exit__(None, None, None)  # type: ignore[has-type]
