@@ -14,16 +14,32 @@ GET  /healthz                                  liveness — {"ok": true, "versio
 GET  /sources                                  list of registered source modules
 POST /pull/{source}                            run a one-shot pull, blocks until complete
 POST /compute/{feature_name}/v/{version}       run one feature compute, blocks until complete
+POST /compute/incremental                      recompute all macro features over a lookback window
 GET  /features                                 list features registered in the Python definitions.py
+
+Automatic compute loop
+----------------------
+When ``INGEST_COMPUTE_AUTO=true``, the server starts a background asyncio
+loop that calls ``_compute_all_macro`` every ``INGEST_COMPUTE_INTERVAL_HOURS``
+hours (default 4).  ``INGEST_COMPUTE_LOOKBACK_HOURS`` (default 72) sets how
+far back each incremental run reaches — wide enough to catch any raw-data row
+that arrived late or was backfilled between ticks.
+
+The Java ``MlIngestScheduleRefresher`` can also trigger a one-shot incremental
+compute immediately after a successful pull by calling
+``POST /compute/incremental``.
 """
 from __future__ import annotations
 
+import asyncio
 import importlib
 import logging
 import time
-from datetime import datetime
-from types import ModuleType
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
+from functools import partial
 from typing import Any
+from types import ModuleType
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
@@ -83,10 +99,118 @@ class PullRequest(BaseModel):
     config: dict[str, Any] = Field(default_factory=dict, description="Source-specific params")
 
 
+def _compute_all_macro(lookback_hours: int) -> dict[str, Any]:
+    """Run an incremental compute for every macro (non-market_data) feature.
+
+    Returns a summary dict suitable for returning from an endpoint or logging.
+    Failures on individual features are caught, logged, and counted — one
+    bad transformer should not block the rest.
+    """
+    end = datetime.now(tz=timezone.utc).replace(tzinfo=None)
+    start = end - timedelta(hours=lookback_hours)
+    macro_features = [f for f in FEATURES if f.raw_tables == ("macro_raw",)]
+
+    results: list[dict[str, Any]] = []
+    total_rows = 0
+    failures = 0
+
+    for feat in macro_features:
+        t0 = time.monotonic()
+        try:
+            with get_connection() as conn:
+                run_id = start_run(feat, range_start=start, range_end=end, conn=conn)
+                try:
+                    df = compute_feature(feat, start=start, end=end, conn=conn)
+                except Exception as e:  # noqa: BLE001
+                    conn.rollback()
+                    fail_run(run_id, error_message=str(e), conn=conn)
+                    raise
+
+                if df is None or df.empty:
+                    finish_run(run_id, rows_written=0, conn=conn)
+                    results.append({"feature": feat.name, "rows": 0, "status": "empty"})
+                    continue
+
+                written = write_values(feat, df, run_id=run_id, conn=conn)
+                finish_run(run_id, rows_written=written, conn=conn)
+            total_rows += written
+            results.append({
+                "feature": feat.name,
+                "rows": written,
+                "status": "ok",
+                "duration_s": round(time.monotonic() - t0, 2),
+            })
+        except Exception as e:  # noqa: BLE001
+            failures += 1
+            logger.exception("auto_compute failed | feature=%s", feat.name)
+            results.append({"feature": feat.name, "status": "error", "error": str(e)[:200]})
+
+    logger.info(
+        "auto_compute done | features=%d rows=%d failures=%d lookback_h=%d",
+        len(macro_features), total_rows, failures, lookback_hours,
+    )
+    return {
+        "features_computed": len(macro_features),
+        "total_rows": total_rows,
+        "failures": failures,
+        "lookback_hours": lookback_hours,
+        "window_start": start.isoformat(),
+        "window_end": end.isoformat(),
+        "detail": results,
+    }
+
+
+async def _compute_loop(interval_hours: int, lookback_hours: int) -> None:
+    """Background async task: compute all macro features every N hours."""
+    interval_seconds = interval_hours * 3600
+    logger.info(
+        "compute_loop started | interval_h=%d lookback_h=%d",
+        interval_hours, lookback_hours,
+    )
+    while True:
+        try:
+            await asyncio.sleep(interval_seconds)
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(
+                None,
+                partial(_compute_all_macro, lookback_hours),
+            )
+        except asyncio.CancelledError:
+            logger.info("compute_loop cancelled")
+            return
+        except Exception:  # noqa: BLE001
+            logger.exception("compute_loop iteration failed — continuing")
+
+
+@asynccontextmanager
+async def _lifespan(settings_ref: Any, app: FastAPI):  # noqa: ANN001
+    settings = settings_ref
+    compute_task: asyncio.Task | None = None
+    if settings.compute_auto:
+        compute_task = asyncio.create_task(
+            _compute_loop(settings.compute_interval_hours, settings.compute_lookback_hours),
+            name="ingest-compute-loop",
+        )
+        logger.info(
+            "ingest auto-compute enabled | interval_h=%d lookback_h=%d",
+            settings.compute_interval_hours, settings.compute_lookback_hours,
+        )
+    try:
+        yield
+    finally:
+        if compute_task is not None:
+            compute_task.cancel()
+            try:
+                await compute_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+
+
 app = FastAPI(
     title="blackheart-ingest",
     version=__version__,
     description="Pulls macro/sentiment/on-chain data from free sources into Postgres *_raw tables.",
+    lifespan=partial(_lifespan, get_settings()),
 )
 
 
@@ -150,6 +274,32 @@ def pull(source: str, body: PullRequest) -> dict[str, Any]:
     payload = result.to_json()
     payload["dispatch_duration_seconds"] = round(time.monotonic() - started, 3)
     return payload
+
+
+class IncrementalComputeRequest(BaseModel):
+    lookback_hours: int = Field(
+        default=72,
+        ge=1,
+        le=8760,
+        description="How many hours back to (re)compute. Defaults to settings value.",
+    )
+
+
+@app.post("/compute/incremental")
+def compute_incremental(body: IncrementalComputeRequest | None = None) -> dict[str, Any]:
+    """Recompute all macro (non-market_data) features over a lookback window.
+
+    Intended for two callers:
+    * The Java ``MlIngestScheduleRefresher`` — call immediately after a
+      successful ``/pull`` to update feature_values with the fresh raw rows.
+    * Operators doing a manual catch-up without a full CLI backfill.
+
+    Runs synchronously (blocks until all features are done). For large
+    windows prefer the CLI ``python -m blackheart_ingest.workers.compute_features``.
+    """
+    settings = get_settings()
+    lookback = body.lookback_hours if body else settings.compute_lookback_hours
+    return _compute_all_macro(lookback)
 
 
 class ComputeRequest(BaseModel):

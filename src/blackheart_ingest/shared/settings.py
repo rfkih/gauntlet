@@ -34,6 +34,13 @@ class Settings(BaseSettings):
     default_max_backfill_lag_hours: int = Field(default=72, ge=1, le=8760)
     log_level: str = "INFO"
 
+    # Automatic feature compute loop (background task inside the ingest server).
+    # Set INGEST_COMPUTE_AUTO=true to enable; disabled by default so existing
+    # deployments are not silently changed.
+    compute_auto: bool = False
+    compute_interval_hours: int = Field(default=4, ge=1, le=168)
+    compute_lookback_hours: int = Field(default=72, ge=1, le=8760)
+
     def db_kwargs(self) -> dict[str, object]:
         """Connection keyword args for ``psycopg.connect(**kwargs)``.
 
